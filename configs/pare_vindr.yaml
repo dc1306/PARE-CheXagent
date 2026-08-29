@@ -1,0 +1,42 @@
+# VinDr-CXR Cross-Dataset Evaluation Configuration
+# Uses MIMIC-trained probes + OT maps, evaluated on VinDr-CXR test set.
+
+model:
+  name: "StanfordAIMI/CheXagent-8b"
+  device: "cuda:0"
+  dtype: "float16"
+  max_new_tokens: 512
+  decoding: "greedy"
+
+data:
+  dataset: "VinDr-CXR"
+  root: "/path/to/VinDr-CXR"
+  test_size: 3000
+  view: "PA"                 # VinDr is PA-only
+  labeling: "radiologist"    # 5-radiologist consensus (not report-derived)
+
+prompt:
+  template: "Describe the findings in this chest X-ray."
+
+pathologies:
+  target:
+    - Atelectasis
+    - Cardiomegaly
+    - LungOpacity            # VinDr naming convention
+    - PleuralEffusion
+    - PulmonaryEdema
+
+pare:
+  # Frozen from MIMIC training — NOT retrained on VinDr
+  source: "MIMIC-CXR"
+  probe_layer: 31
+  steer_layer: 3
+  n_visual_tokens: 128
+  lambda: 1.0
+  pca_dims: 128
+
+evaluation:
+  # VinDr uses image-level labels, not F1CheXbert report comparison
+  primary_metric: "image-label F1"
+  scorer: "CheXbert"         # CheXbert labels generated report → compare vs VinDr GT
+  note: "NOT F1CheXbert (no reference reports in VinDr)"

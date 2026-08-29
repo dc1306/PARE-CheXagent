@@ -7,7 +7,9 @@ PARE improves CheXagent-8B's diagnostic sensitivity without finetuning by:
 2. **Steering** (L3) visual token representations via Monge OT transport maps
 3. **Merging** steered findings into baseline reports (append-only, baseline-immutable)
 
-## Results (MIMIC-CXR Official Test Split, N=3,269)
+## Results
+
+### Primary Evaluation: MIMIC-CXR (N=3,269 test studies)
 
 | Metric | Baseline | PARE | Merged Text | Δ |
 |--------|:--------:|:----:|:-----------:|:-:|
@@ -19,25 +21,64 @@ PARE improves CheXagent-8B's diagnostic sensitivity without finetuning by:
 
 **L31 Probe AUROC:** Mean 0.7929 across Target-5 pathologies
 
+### External Validation: VinDr-CXR (N=3,000 test images)
+
+Cross-dataset generalization using MIMIC-trained probes + OT maps evaluated on independently radiologist-annotated Vietnamese CXRs. See `configs/pare_vindr.yaml`.
+
 ## Pipeline
 
 ```
-01_baseline_generation.py   → Frozen CheXagent-8B baseline reports
-02_pare_train.py            → Train L31 probes + L3 Monge OT maps (15K studies)
-03_pare_test.py             → Probe-gated steering on test set (3,269 studies)
-04_merge_eval.py            → Safe append-only text merger + F1CheXbert eval
-05_significance_tests.py    → Bootstrap CI + McNemar's tests
-06_vindr_evaluation.py      → Cross-dataset generalization (VinDr-CXR)
+scripts/
+├── 00_prepare_mimic.py         # MIMIC-CXR manifest + U-Ones GT labels
+├── 01_baseline_generation.py   # Frozen CheXagent-8B baseline reports
+├── 02_pare_train.py            # Train L31 probes + L3 Monge OT maps
+├── 03_pare_test.py             # Probe-gated steering on test set
+├── 04_merge_eval.py            # Safe append-only text merger + F1CheXbert
+├── 05_significance_tests.py    # Bootstrap CI + McNemar's tests
+└── 06_vindr_evaluation.py      # VinDr cross-dataset generalization
+
+configs/
+├── pare_mimic.yaml             # MIMIC-CXR experiment settings
+└── pare_vindr.yaml             # VinDr-CXR evaluation settings
+
+utils/
+└── safe_merger.py              # Append-only report merger (baseline immutable)
 ```
 
-## Requirements
+## Setup
 
-- Python 3.10+
-- PyTorch 2.0+
-- `transformers`, `f1chexbert` (requires `scikit-learn==1.5.2`)
-- `scipy`, `scikit-learn`
-- Access to MIMIC-CXR dataset (PhysioNet credentialed)
-- CheXagent-8B model weights (`StanfordAIMI/CheXagent-8b`)
+```bash
+pip install -r requirements.txt
+```
+
+### Data Access
+
+- **MIMIC-CXR**: Requires PhysioNet credentialed access
+- **VinDr-CXR**: Requires PhysioNet credentialed access + CITI training
+- **CheXagent-8B**: HuggingFace model `StanfordAIMI/CheXagent-8b`
+
+### Reproduction
+
+```bash
+# 1. Prepare data manifest
+export MIMIC_ROOT=/path/to/MIMIC-CXR
+python scripts/00_prepare_mimic.py
+
+# 2. Generate baseline reports
+python scripts/01_baseline_generation.py
+
+# 3. Train PARE (probes + OT maps)
+python scripts/02_pare_train.py
+
+# 4. Run PARE on test set
+python scripts/03_pare_test.py
+
+# 5. Merge reports + evaluate
+python scripts/04_merge_eval.py
+
+# 6. Statistical significance
+python scripts/05_significance_tests.py
+```
 
 ## Configuration
 
@@ -52,15 +93,21 @@ PARE improves CheXagent-8B's diagnostic sensitivity without finetuning by:
 | GT labeling | U-Ones (uncertain → positive) |
 | Decoding | Greedy (beam=1, deterministic) |
 
-## Protocol
+## Expected Outputs
 
-1. **Baseline**: Generate reports with frozen CheXagent-8B
-2. **Feature extraction**: Extract L3 (128 visual tokens) and L31 (mean-pooled) representations
-3. **Probe training**: Logistic regression on L31 features per pathology
-4. **OT map construction**: Monge maps from FN→TP distributions in PCA-128 space
-5. **Gated steering**: Apply L3 transport only when L31 probe fires above threshold
-6. **Report merging**: Append genuinely new PARE findings to immutable baseline text
-7. **Evaluation**: F1CheXbert against radiologist reference reports
+Running the full pipeline produces (not committed):
+
+```
+outputs/
+├── test_manifest.json          # From 00_prepare_mimic.py
+├── chexagent_8b_reports.json   # From 01_baseline_generation.py
+├── pare_train_artifacts.pt     # From 02_pare_train.py (probes, maps, scalers)
+├── pare_test_reports.json      # From 03_pare_test.py
+├── pare_merged_reports.json    # From 04_merge_eval.py
+├── pare_merged_eval.json       # From 04_merge_eval.py
+├── pare_all_reports.csv        # From 04_merge_eval.py (master CSV)
+└── significance.out            # From 05_significance_tests.py
+```
 
 ## Target Pathologies
 
@@ -68,4 +115,4 @@ Atelectasis, Cardiomegaly, Lung Opacity, Pleural Effusion, Edema
 
 ## License
 
-Research use only. Requires MIMIC-CXR data use agreement.
+Research use only. Requires MIMIC-CXR and VinDr-CXR data use agreements.

@@ -1,0 +1,69 @@
+# PARE Experiment Configuration — CheXagent-8B on MIMIC-CXR
+# All values match the standardized pipeline used for published results.
+
+model:
+  name: "StanfordAIMI/CheXagent-8b"
+  device: "cuda:0"
+  dtype: "float16"
+  max_new_tokens: 512
+  decoding: "greedy"         # beam=1, do_sample=False, deterministic
+
+data:
+  dataset: "MIMIC-CXR"
+  root: "/path/to/MIMIC-CXR"
+  split: "official"          # mimic-cxr-2.0.0-split.csv
+  labeling: "U-Ones"         # uncertain (-1) → positive (1)
+  max_images_per_study: 2
+  image_priority: "frontal"  # PA/AP preferred over lateral
+
+prompt:
+  # Baseline prompt (indication-conditioned)
+  template: 'Given the indication: "{indication}", write a structured findings section for the CXR.'
+  fallback: "Write the findings section for this chest X-ray."
+
+pathologies:
+  # Target-5: pathologies with sufficient CheXpert GT for evaluation
+  target:
+    - Atelectasis
+    - Cardiomegaly
+    - Lung Opacity
+    - Pleural Effusion
+    - Edema
+
+  # CheXbert label indices (0-based, 14-label schema)
+  chexbert_indices:
+    Cardiomegaly: 1
+    Lung Opacity: 2
+    Edema: 4
+    Atelectasis: 7
+    Pleural Effusion: 9
+
+pare:
+  # Architecture
+  probe_layer: 31            # L31 mean-pooled for binary classification
+  steer_layer: 3             # L3 visual token steering
+  n_visual_tokens: 128       # Number of tokens steered
+
+  # Hyperparameters (fixed for published results)
+  lambda: 1.0                # OT map strength
+  pca_dims: 128              # PCA compression for Monge maps
+  cov_reg: 1.0e-5            # Covariance regularization
+
+  # Probe training
+  probe_model: "LogisticRegression"
+  probe_C: 0.01
+  probe_max_iter: 3000
+
+  # Training data
+  train_studies: 15000
+  seed: 42
+
+evaluation:
+  scorer: "F1CheXbert"
+  metrics:
+    - "Micro-F1-14"
+    - "Macro-F1-14"
+    - "Target-5 Macro-F1"
+  significance:
+    bootstrap_resamples: 2000
+    mcnemar: true
