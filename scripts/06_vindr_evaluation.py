@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-VinDr-CXR Cross-Dataset Generalization — PARE Evaluation
-Uses MIMIC-CXR-trained probes + OT maps on VinDr-CXR test set.
-Reproduces the exact pare_reverify_part2.py pipeline on a new dataset.
+06_vindr_pare.py — VinDr-CXR Adapted PARE Pipeline
+====================================================
+Complete end-to-end: baseline → feature extraction → probe training →
+Monge OT maps → gated steering → CheXbert evaluation.
+
+Uses VinDr-CXR train for PARE training, VinDr-CXR test for evaluation.
+Does NOT use MIMIC-trained components (that's the transfer experiment).
+
+VinDr specifics:
+  - PA-view only (single image per sample)
+  - Radiologist-annotated labels (not report-derived)
+  - No reference reports → evaluate CheXbert labels vs radiologist GT
+  - Edema excluded (0 test positives)
 """
-import os; os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-import torch, json, time, sys, gc, numpy as np, warnings, re
+import os; os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_DEVICE_ID", "0")
+import torch, json, time, sys, gc, re, pickle, warnings
+import numpy as np, pandas as pd
 from pathlib import Path
 from PIL import Image
 from sklearn.preprocessing import StandardScaler
@@ -14,380 +25,448 @@ from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.decomposition import PCA
 from sklearn.covariance import LedoitWolf
 from scipy.linalg import sqrtm, inv
+from f1chexbert import F1CheXbert
 warnings.filterwarnings('ignore')
 
+# ── Configuration ──
 DEVICE = "cuda:0"; DTYPE = torch.float16
 MODEL_NAME = "StanfordAIMI/CheXagent-8b"
-PROMPT = "Describe the findings in this chest X-ray."
-FORMATTED_PROMPT = f" USER: <s>{PROMPT} ASSISTANT: <s>"
-N_VIS = 128; STEER_LAYER = 3; PCA_DIMS = 128; BEST_LAMBDA = 1.0
+PROMPT = "Write the findings section for this chest X-ray."
+MAX_NEW_TOKENS = 512
+N_VIS = 128; STEER_LAYER = 3; PROBE_LAYER = 31
+PCA_DIMS = 128; BEST_LAMBDA = 1.0; COV_REG = 1e-5
 
-PATHOLOGIES = ['Atelectasis','Cardiomegaly','LungOpacity','PleuralEffusion','PulmonaryEdema']
-LABEL_KEYS = {'Atelectasis':'y_uo_Atelectasis','Cardiomegaly':'y_uo_Cardiomegaly',
-    'LungOpacity':'y_uo_Lung Opacity','PleuralEffusion':'y_uo_Pleural Effusion',
-    'PulmonaryEdema':'y_uo_Pulmonary Edema'}
-CHEXBERT_IDX = {'Cardiomegaly':1,'LungOpacity':2,'PulmonaryEdema':4,'Atelectasis':7,'PleuralEffusion':9}
+VINDR_ROOT = os.environ.get("VINDR_ROOT",
+    "/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/vindr_cxr/physionet.org/files/vindr-cxr/1.0.0")
+OUT_DIR = os.environ.get("OUTPUT_DIR",
+    "/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/vindr_standardized")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-MIMIC_EXP = Path('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/pare_reverify')
-FEAT_DIR = Path('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/official_cls_v2')
-OUTDIR = Path('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/vindr_evaluation')
-OUTDIR.mkdir(exist_ok=True)
+# VinDr Target-4 (Edema excluded: 0 test positives)
+PATHOLOGIES = ['Atelectasis', 'Cardiomegaly', 'Lung Opacity', 'Pleural Effusion']
+VINDR_COLS = {'Atelectasis': 'Atelectasis', 'Cardiomegaly': 'Cardiomegaly',
+              'Lung Opacity': 'Lung Opacity', 'Pleural Effusion': 'Pleural effusion'}
+CHEXBERT_IDX = {'Cardiomegaly': 1, 'Lung Opacity': 2, 'Atelectasis': 7, 'Pleural Effusion': 9}
 
-LOG = OUTDIR / 'evaluation.log'
+LOG = open(f"{OUT_DIR}/vindr_pare.log", "w")
 def log(msg):
-    ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    line = f"[{ts}] {msg}"; print(line, flush=True)
-    with open(LOG,'a') as f: f.write(line+'\n')
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    LOG.write(line + "\n"); LOG.flush()
+    print(line, flush=True)
 
-log("="*70)
-log("  VinDr-CXR Cross-Dataset Generalization")
-log("="*70)
+# ══════════════════════════════════════════════════════════════════════
+# Step 0: Load VinDr data
+# ══════════════════════════════════════════════════════════════════════
+log("Step 0: Loading VinDr-CXR data")
 
-# ═══════════════════════════════════════════════════
-# STEP 0: Load VinDr-CXR test labels + convert DICOMs
-# ═══════════════════════════════════════════════════
-import pandas as pd
-labels_df = pd.read_csv('experiments/vindr_cxr/physionet.org/files/vindr-cxr/1.0.0/annotations/image_labels_test.csv')
-vindr_gt = {}
-for _, row in labels_df.iterrows():
-    vindr_gt[row['image_id']] = {
-        'Atelectasis': int(row.get('Atelectasis', 0)),
-        'Cardiomegaly': int(row.get('Cardiomegaly', 0)),
-        'LungOpacity': int(row.get('Lung Opacity', 0)),
-        'PleuralEffusion': int(row.get('Pleural effusion', 0)),
-        'PulmonaryEdema': int(row.get('Edema', 0)),
-    }
-img_ids = sorted(vindr_gt.keys())
-prevalence = {p: sum(v[p] for v in vindr_gt.values()) for p in PATHOLOGIES}
-log(f"VinDr-CXR test: {len(img_ids)} images")
-log(f"Prevalence: {prevalence}")
+train_labels = pd.read_csv(f"{VINDR_ROOT}/annotations/image_labels_train.csv")
+test_labels = pd.read_csv(f"{VINDR_ROOT}/annotations/image_labels_test.csv")
 
-# Convert DICOMs
-import pydicom
-dicom_dir = '/mnt/raid/obed/arjun/smooth_ae_vinbigdata/smooth_ae_vinbig/vinbigdata/test'
-jpg_dir = OUTDIR / 'test_jpgs'
-jpg_dir.mkdir(exist_ok=True)
+# Train: majority vote across annotators
+train_gt = train_labels.groupby('image_id')[list(VINDR_COLS.values())].max().reset_index()
+test_gt = test_labels  # Test has single consensus annotation
 
-converted = 0
-for img_id in img_ids:
-    jpg_path = jpg_dir / f'{img_id}.jpg'
-    if jpg_path.exists(): converted += 1; continue
-    dicom_path = f'{dicom_dir}/{img_id}.dicom'
-    if not os.path.exists(dicom_path): continue
-    try:
-        ds = pydicom.dcmread(dicom_path)
-        arr = ds.pixel_array.astype(float)
-        if hasattr(ds, 'PhotometricInterpretation') and ds.PhotometricInterpretation == 'MONOCHROME1':
-            arr = arr.max() - arr
-        arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255).astype(np.uint8)
-        Image.fromarray(arr).convert('RGB').save(str(jpg_path), quality=95)
-        converted += 1
-    except Exception as ex:
-        if converted < 5: log(f"  DICOM ERR: {ex}")
-    if converted % 500 == 0: log(f"  Converted {converted}...")
-log(f"  {converted} JPGs ready")
-
-# ═══════════════════════════════════════════════════
-# STEP 1: Load MIMIC-trained probes + Monge maps
-# ═══════════════════════════════════════════════════
-log("\n[Step1] Loading MIMIC-trained probes + Monge maps...")
-train_manifest = json.load(open(FEAT_DIR/'train_manifest.json'))[:60000]
-val_manifest = json.load(open(FEAT_DIR/'validate_manifest.json'))
-train_idx = np.load(MIMIC_EXP/'train_idx.npy')
-train_sub = [train_manifest[i] for i in train_idx]
-
-train_l3 = np.load(MIMIC_EXP/'train_l3_tokens.npy')  # (15000, 128, 4096)
-train_l31 = np.load(MIMIC_EXP/'train_l31_mean.npy')
-val_l31 = np.load(MIMIC_EXP/'val_l31_mean.npy')
-train_cb = json.load(open(MIMIC_EXP/'train_chexbert_labels.json'))
-
-gt_train = {}; gt_val = {}
+log(f"  Train: {len(train_gt)} images")
+log(f"  Test: {len(test_gt)} images")
 for p in PATHOLOGIES:
-    k = LABEL_KEYS[p]
-    gt_train[p] = np.array([int(train_sub[i].get(k,0)) for i in range(len(train_sub))])
-    gt_val[p] = np.array([int(e.get(k,0)) for e in val_manifest])
+    vc = VINDR_COLS[p]
+    tr_pos = (train_gt[vc] > 0).sum()
+    te_pos = (test_gt[vc] > 0).sum()
+    log(f"  {p:22s}: train={tr_pos}, test={te_pos}")
 
-# Train probes on MIMIC L31
-sc31 = StandardScaler()
-d31_tr = sc31.fit_transform(train_l31)
-d31_va = sc31.transform(val_l31)
+# Find image paths
+def find_images(image_ids, split):
+    paths = {}
+    img_dir = f"{VINDR_ROOT}/{split}"
+    for iid in image_ids:
+        for ext in ['.png', '.jpg', '.jpeg', '.dicom']:
+            p = f"{img_dir}/{iid}{ext}"
+            if os.path.exists(p):
+                paths[iid] = p; break
+    return paths
 
-probes = {}; thresholds = {}
-for p in PATHOLOGIES:
-    clf = LogisticRegression(penalty='l1', solver='liblinear', C=0.01,
-                              class_weight='balanced', max_iter=5000, random_state=42)
-    clf.fit(d31_tr, gt_train[p])
-    val_scores = clf.predict_proba(d31_va)[:,1]
-    fpr,tpr,th = roc_curve(gt_val[p], val_scores)
-    thresholds[p] = float(th[np.argmax(tpr - fpr)])
-    probes[p] = clf
-    log(f"  {p:20s}: thresh={thresholds[p]:.4f}")
+log("  Finding train images...")
+train_paths = find_images(train_gt['image_id'].values, 'train')
+log(f"  Found {len(train_paths)}/{len(train_gt)} train images")
 
-# Build Monge maps from MIMIC training data (same as part2)
-log("\n[Step2] Building Monge maps from MIMIC training data...")
-monge_maps = {}
-for p in PATHOLOGIES:
-    bl_labels = np.array([train_cb.get(train_sub[i]['dicom_id'],{}).get(p,0) for i in range(len(train_sub))])
-    gt = gt_train[p]
-    tp_mask = (gt == 1) & (bl_labels == 0)  # FN cases: GT positive but baseline missed
-    fn_feats = train_l3[tp_mask]  # shape: (n_fn, 128, 4096)
-    
-    # Also get TP cases for source distribution
-    tp_pos_mask = (gt == 1) & (bl_labels == 1)
-    tp_feats = train_l3[tp_pos_mask] if tp_pos_mask.sum() > 0 else fn_feats
-    
-    log(f"  {p}: FN={tp_mask.sum()}, TP={tp_pos_mask.sum()}")
-    
-    if fn_feats.shape[0] < 10:
-        log(f"    WARNING: too few FN samples, skipping"); continue
-    
-    # PCA on visual tokens
-    all_tokens = np.vstack([fn_feats.reshape(-1, 4096), tp_feats.reshape(-1, 4096)])
-    sc = StandardScaler(); all_sc = sc.fit_transform(all_tokens)
-    pca = PCA(n_components=PCA_DIMS, random_state=42); pca.fit(all_sc)
-    
-    # Source (FN) and Target (TP) distributions in PCA space
-    fn_sc = sc.transform(fn_feats.reshape(-1, 4096))
-    fn_pca = pca.transform(fn_sc).reshape(fn_feats.shape[0], N_VIS, PCA_DIMS)
-    fn_mean = fn_pca.reshape(-1, PCA_DIMS)
-    
-    tp_sc = sc.transform(tp_feats.reshape(-1, 4096))
-    tp_pca = pca.transform(tp_sc).reshape(tp_feats.shape[0], N_VIS, PCA_DIMS)
-    tp_mean = tp_pca.reshape(-1, PCA_DIMS)
-    
-    mu_s = fn_mean.mean(axis=0); mu_t = tp_mean.mean(axis=0)
-    cov_s = LedoitWolf().fit(fn_mean).covariance_
-    cov_t = LedoitWolf().fit(tp_mean).covariance_
-    
-    # Monge map: T(x) = mu_t + A(x - mu_s)
-    S_half = sqrtm(cov_s).real
-    S_half_inv = inv(S_half)
-    M = sqrtm(S_half @ cov_t @ S_half).real
-    A = S_half_inv @ M @ S_half_inv
-    
-    monge_maps[p] = {
-        'A': torch.tensor(A, dtype=torch.float32),
-        'mu_s': torch.tensor(mu_s, dtype=torch.float32),
-        'mu_t': torch.tensor(mu_t, dtype=torch.float32),
-        'sc_mean': torch.tensor(sc.mean_, dtype=torch.float32),
-        'sc_scale': torch.tensor(sc.scale_, dtype=torch.float32),
-        'pca_comp': torch.tensor(pca.components_, dtype=torch.float32),
-        'pca_mean': torch.tensor(pca.mean_, dtype=torch.float32),
-    }
-    log(f"    Monge map built, var_explained={pca.explained_variance_ratio_.sum():.4f}")
-
-# ═══════════════════════════════════════════════════
-# STEP 3: Run CheXagent on VinDr-CXR (baseline + features + steering)
-# ═══════════════════════════════════════════════════
-log("\n[Step3] Running CheXagent on VinDr-CXR...")
-from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
-
-bl_cache = OUTDIR / 'baseline_reports.json'
-feat_cache = OUTDIR / 'features_l31_mean.npy'
-l3_cache = OUTDIR / 'features_l3_tokens.npy'
-st_cache = OUTDIR / 'steered_reports.json'
-
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=DTYPE, trust_remote_code=True).to(DEVICE)
-model.eval()
-proc = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
-gen_config = GenerationConfig.from_pretrained(MODEL_NAME)
-tok = proc.tokenizer
-if tok.pad_token_id is None: tok.pad_token_id = tok.eos_token_id
-dec_layers = model.language_model.model.layers
-
-# Phase A: Baseline + feature extraction
-if bl_cache.exists() and feat_cache.exists() and l3_cache.exists():
-    log("  Loading cached baseline + features...")
-    bl_reports = json.load(open(bl_cache))
-    vindr_l31 = np.load(feat_cache)
-    vindr_l3 = np.load(l3_cache)
+# For test, check pre-converted JPGs first
+test_jpg_dir = f"{os.path.dirname(OUT_DIR)}/vindr_evaluation/test_jpgs"
+if os.path.isdir(test_jpg_dir) and len(os.listdir(test_jpg_dir)) > 0:
+    log(f"  Using pre-converted test JPGs from {test_jpg_dir}")
+    test_paths = {}
+    for f in os.listdir(test_jpg_dir):
+        if f.endswith('.jpg') or f.endswith('.png'):
+            iid = os.path.splitext(f)[0]
+            test_paths[iid] = os.path.join(test_jpg_dir, f)
 else:
-    bl_reports = {}
-    l31_list = []; l3_list = []
-    hook_data = {}
-    
-    def l3_hook(module, inp, output):
-        hook_data['l3'] = output[0].detach().cpu()
-    def l31_hook(module, inp, output):
-        hook_data['l31'] = output[0].detach().cpu()
-    
-    h3 = dec_layers[STEER_LAYER].register_forward_hook(l3_hook)
-    h31 = dec_layers[31].register_forward_hook(l31_hook)
-    
-    t0 = time.time(); errs = 0
-    for idx, img_id in enumerate(img_ids):
-        jpg_path = jpg_dir / f'{img_id}.jpg'
-        if not jpg_path.exists():
-            bl_reports[img_id] = ''
-            l31_list.append(np.zeros(4096)); l3_list.append(np.zeros((N_VIS, 4096)))
-            continue
+    test_paths = find_images(test_gt['image_id'].values, 'test')
+log(f"  Found {len(test_paths)}/{len(test_gt)} test images")
+
+# ══════════════════════════════════════════════════════════════════════
+# Step 1: Load model
+# ══════════════════════════════════════════════════════════════════════
+log("\nStep 1: Loading CheXagent-8B")
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, torch_dtype=DTYPE, trust_remote_code=True
+).to(DEVICE).eval()
+
+# Build chat template
+conv = [{"from": "human", "value": f"<image>\n{PROMPT}"}]
+input_ids = tokenizer.apply_chat_template(conv, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+TEXT_IDS = input_ids  # reused for all images
+
+def load_image(path):
+    img = Image.open(path).convert("RGB")
+    pixel_values = model.process_images([img]).to(DEVICE, dtype=DTYPE)
+    return pixel_values
+
+# ══════════════════════════════════════════════════════════════════════
+# Step 2: Generate baseline reports + extract features (train)
+# ══════════════════════════════════════════════════════════════════════
+TRAIN_CACHE = f"{OUT_DIR}/train_cache.pkl"
+if os.path.exists(TRAIN_CACHE):
+    log("\nStep 2: Loading cached train features")
+    with open(TRAIN_CACHE, 'rb') as f:
+        cache = pickle.load(f)
+    train_l3 = cache['l3']; train_l31 = cache['l31']
+    train_reports = cache['reports']; train_ids = cache['ids']
+    train_labels_arr = cache['labels']
+else:
+    log("\nStep 2: Generating train baseline + extracting features")
+    train_ids = []; train_l3 = []; train_l31 = []; train_reports = []
+    train_labels_arr = {p: [] for p in PATHOLOGIES}
+
+    # Sort by image_id for determinism
+    valid_train = train_gt[train_gt['image_id'].isin(train_paths)].reset_index(drop=True)
+    log(f"  Processing {len(valid_train)} train images")
+
+    hooks = []
+    l3_out = [None]; l31_out = [None]
+
+    def hook_l3(m, inp, out):
+        if hasattr(out, 'last_hidden_state'):
+            l3_out[0] = out.last_hidden_state.detach()
+        elif isinstance(out, tuple):
+            l3_out[0] = out[0].detach()
+
+    def hook_l31(m, inp, out):
+        if hasattr(out, 'last_hidden_state'):
+            l31_out[0] = out.last_hidden_state.detach()
+        elif isinstance(out, tuple):
+            l31_out[0] = out[0].detach()
+
+    hooks.append(model.language_model.model.layers[STEER_LAYER].register_forward_hook(hook_l3))
+    hooks.append(model.language_model.model.layers[PROBE_LAYER].register_forward_hook(hook_l31))
+
+    errors = 0
+    for i, row in valid_train.iterrows():
+        iid = row['image_id']
         try:
-            img = Image.open(str(jpg_path)).convert('RGB')
-            inputs = proc(images=[img], text=FORMATTED_PROMPT, return_tensors='pt')
-            for k,v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(DEVICE) if v.dtype in (torch.long,torch.int) else v.to(DEVICE, dtype=DTYPE)
-            
+            pv = load_image(train_paths[iid])
             with torch.no_grad():
-                ids = model.generate(**inputs, generation_config=gen_config, max_new_tokens=300, pad_token_id=tok.pad_token_id)
-            
-            report = tok.decode(ids[0], skip_special_tokens=True).strip()
-            bl_reports[img_id] = report
-            
+                out = model.generate(input_ids=TEXT_IDS, pixel_values=pv,
+                                     max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+                report = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
             # Extract features
-            l31_feat = hook_data.get('l31', torch.zeros(1,1,4096))
-            l31_list.append(l31_feat.mean(dim=1).squeeze().numpy()[:4096])
-            
-            l3_feat = hook_data.get('l3', torch.zeros(1,N_VIS,4096))
-            l3_tokens = l3_feat[0,:N_VIS,:].numpy() if l3_feat.shape[1] >= N_VIS else np.zeros((N_VIS, 4096))
-            l3_list.append(l3_tokens)
-            
-        except Exception as ex:
-            bl_reports[img_id] = ''; errs += 1
-            l31_list.append(np.zeros(4096)); l3_list.append(np.zeros((N_VIS, 4096)))
-            if errs <= 3: log(f"  ERR: {ex}")
-        
-        if (idx+1) % 100 == 0:
-            rate = (idx+1)/(time.time()-t0)
-            log(f"  BL {idx+1}/{len(img_ids)} ({rate:.1f}/s, err:{errs})")
-    
-    h3.remove(); h31.remove()
-    vindr_l31 = np.array(l31_list); vindr_l3 = np.array(l3_list)
-    json.dump(bl_reports, open(bl_cache, 'w'))
-    np.save(feat_cache, vindr_l31); np.save(l3_cache, vindr_l3)
-    log(f"  Baseline done: {len(bl_reports)}, l31={vindr_l31.shape}, l3={vindr_l3.shape}")
+            vis_l3 = l3_out[0][0, :N_VIS, :].cpu().numpy()
+            vis_l31 = l31_out[0][0, :N_VIS, :].mean(dim=0).cpu().numpy()
 
-# Phase B: Probe scores on VinDr features
-log("\n[Step4] Computing probe scores on VinDr features...")
-d31_vindr = sc31.transform(vindr_l31)
-probe_scores_vindr = {}
+            train_ids.append(iid)
+            train_l3.append(vis_l3)
+            train_l31.append(vis_l31)
+            train_reports.append(report)
+            for p in PATHOLOGIES:
+                train_labels_arr[p].append(1 if row[VINDR_COLS[p]] > 0 else 0)
+
+        except Exception as e:
+            errors += 1
+            if errors <= 5: log(f"  Error on {iid}: {e}")
+
+        if (i+1) % 200 == 0:
+            log(f"  {i+1}/{len(valid_train)} (err={errors})")
+
+    for h in hooks: h.remove()
+
+    train_l3 = np.array(train_l3)
+    train_l31 = np.array(train_l31)
+    train_labels_arr = {p: np.array(v) for p, v in train_labels_arr.items()}
+
+    log(f"  Train done: {len(train_ids)} images, {errors} errors")
+    log(f"  L3 shape: {train_l3.shape}, L31 shape: {train_l31.shape}")
+
+    with open(TRAIN_CACHE, 'wb') as f:
+        pickle.dump({'l3': train_l3, 'l31': train_l31, 'reports': train_reports,
+                      'ids': train_ids, 'labels': train_labels_arr}, f)
+    log(f"  Cached to {TRAIN_CACHE}")
+
+# ══════════════════════════════════════════════════════════════════════
+# Step 3: Train probes + Monge maps
+# ══════════════════════════════════════════════════════════════════════
+log("\nStep 3: Training probes + Monge maps")
+
+scaler31 = StandardScaler().fit(train_l31)
+X31 = scaler31.transform(train_l31)
+
+probes = {}; thresholds = {}; monge_maps = {}; pca_models = {}; scalers_l3 = {}
+
 for p in PATHOLOGIES:
-    probe_scores_vindr[p] = probes[p].predict_proba(d31_vindr)[:,1]
-    fires = sum(probe_scores_vindr[p] >= thresholds[p])
-    log(f"  {p}: fires={fires}/{len(img_ids)} ({fires/len(img_ids)*100:.1f}%)")
+    y = train_labels_arr[p]
+    n_pos = y.sum(); n_neg = len(y) - n_pos
+    log(f"\n  {p}: pos={n_pos}, neg={n_neg}")
 
-# Phase C: Steered reports
-if st_cache.exists():
-    log("\n  Loading cached steered reports...")
-    st_reports = json.load(open(st_cache))
-else:
-    log("\n[Step5] Generating steered reports...")
-    # Precompute deltas
-    test_deltas = {}
-    for idx, img_id in enumerate(img_ids):
-        tokens = torch.tensor(vindr_l3[idx], dtype=torch.float32)
-        per_path = {}
+    if n_pos < 10:
+        log(f"  SKIP: insufficient positives")
+        continue
+
+    # Train L31 probe
+    probe = LogisticRegression(C=0.01, max_iter=3000, solver='lbfgs')
+    probe.fit(X31, y)
+    probs = probe.predict_proba(X31)[:, 1]
+
+    # Youden threshold
+    fpr, tpr, thr = roc_curve(y, probs)
+    youden = tpr - fpr
+    best_idx = np.argmax(youden)
+    threshold = thr[best_idx]
+    auc = roc_auc_score(y, probs)
+    log(f"  Probe: AUROC={auc:.4f}, threshold={threshold:.4f}")
+
+    probes[p] = probe
+    thresholds[p] = threshold
+
+    # Build Monge map from L3 tokens
+    # FN = positive but probe says negative, TP = positive and probe says positive
+    pos_mask = y == 1
+    fn_mask = pos_mask & (probs < threshold)
+    tp_mask = pos_mask & (probs >= threshold)
+
+    fn_count = fn_mask.sum(); tp_count = tp_mask.sum()
+    log(f"  FN={fn_count}, TP={tp_count}")
+
+    if fn_count < 15 or tp_count < 15:
+        log(f"  SKIP Monge: insufficient FN/TP")
+        continue
+
+    # PCA on L3 visual tokens (flatten: N_VIS * hidden_dim → PCA_DIMS)
+    fn_l3 = train_l3[fn_mask].reshape(fn_count, -1)
+    tp_l3 = train_l3[tp_mask].reshape(tp_count, -1)
+
+    pca = PCA(n_components=PCA_DIMS, random_state=42)
+    all_l3 = np.vstack([fn_l3, tp_l3])
+    pca.fit(all_l3)
+    var_exp = pca.explained_variance_ratio_.sum()
+    log(f"  PCA: {PCA_DIMS}d, var_explained={var_exp:.4f}")
+
+    fn_pca = pca.transform(fn_l3)
+    tp_pca = pca.transform(tp_l3)
+
+    # Monge OT map: T(x) = A(x - mu_fn) + mu_tp
+    mu_fn = fn_pca.mean(axis=0)
+    mu_tp = tp_pca.mean(axis=0)
+
+    cov_fn = LedoitWolf().fit(fn_pca).covariance_ + COV_REG * np.eye(PCA_DIMS)
+    cov_tp = LedoitWolf().fit(tp_pca).covariance_ + COV_REG * np.eye(PCA_DIMS)
+
+    sqrt_fn = sqrtm(cov_fn)
+    sqrt_fn_inv = inv(sqrt_fn)
+    inner = sqrtm(sqrt_fn @ cov_tp @ sqrt_fn)
+    A = sqrt_fn_inv @ inner @ sqrt_fn_inv
+
+    monge_maps[p] = {'A': A.real, 'mu_fn': mu_fn, 'mu_tp': mu_tp}
+    pca_models[p] = pca
+    log(f"  Monge map built")
+
+# Save components
+COMP_PATH = f"{OUT_DIR}/vindr_pare_components.pkl"
+with open(COMP_PATH, 'wb') as f:
+    pickle.dump({
+        'probes': probes, 'thresholds': thresholds, 'monge_maps': monge_maps,
+        'pca_models': pca_models, 'scaler31': scaler31,
+        'pathologies': PATHOLOGIES, 'config': {
+            'probe_layer': PROBE_LAYER, 'steer_layer': STEER_LAYER,
+            'pca_dims': PCA_DIMS, 'lambda': BEST_LAMBDA, 'n_vis': N_VIS
+        }
+    }, f)
+log(f"\nSaved components to {COMP_PATH}")
+
+# ══════════════════════════════════════════════════════════════════════
+# Step 4: Test — baseline + steered reports
+# ══════════════════════════════════════════════════════════════════════
+log("\nStep 4: Generating test baseline + steered reports")
+
+# Compute deltas for each pathology
+deltas = {}
+for p in PATHOLOGIES:
+    if p not in monge_maps:
+        continue
+    mm = monge_maps[p]
+    pca = pca_models[p]
+
+    # Precompute delta for mean FN → TP shift
+    mu_fn_full = pca.inverse_transform(mm['mu_fn'].reshape(1, -1)).reshape(N_VIS, -1)
+    shifted = pca.inverse_transform(
+        (mm['A'] @ (mm['mu_fn'] - mm['mu_fn']).reshape(-1, 1) + mm['mu_tp'].reshape(-1, 1)).T
+    ).reshape(N_VIS, -1)
+    # Actually compute per-sample at test time
+    deltas[p] = {'A': mm['A'], 'mu_fn': mm['mu_fn'], 'mu_tp': mm['mu_tp'], 'pca': pca}
+
+valid_test = test_gt[test_gt['image_id'].isin(test_paths)].reset_index(drop=True)
+log(f"  Processing {len(valid_test)} test images")
+
+hooks = []
+l3_out = [None]; l31_out = [None]
+def hook_l3(m, inp, out):
+    if hasattr(out, 'last_hidden_state'): l3_out[0] = out.last_hidden_state.detach()
+    elif isinstance(out, tuple): l3_out[0] = out[0].detach()
+def hook_l31(m, inp, out):
+    if hasattr(out, 'last_hidden_state'): l31_out[0] = out.last_hidden_state.detach()
+    elif isinstance(out, tuple): l31_out[0] = out[0].detach()
+hooks.append(model.language_model.model.layers[STEER_LAYER].register_forward_hook(hook_l3))
+hooks.append(model.language_model.model.layers[PROBE_LAYER].register_forward_hook(hook_l31))
+
+results = []
+errors = 0
+
+for i, row in valid_test.iterrows():
+    iid = row['image_id']
+    try:
+        pv = load_image(test_paths[iid])
+
+        # Baseline
+        with torch.no_grad():
+            out = model.generate(input_ids=TEXT_IDS, pixel_values=pv,
+                                 max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+            bl_report = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
+        bl_l3 = l3_out[0][0, :N_VIS, :].clone()
+        bl_l31 = l31_out[0][0, :N_VIS, :].mean(dim=0).cpu().numpy()
+
+        # Probe scores
+        x31 = scaler31.transform(bl_l31.reshape(1, -1))
+        probe_scores = {}
+        fired = []
         for p in PATHOLOGIES:
-            if p not in monge_maps: continue
-            mm = monge_maps[p]
-            x_sc = (tokens - mm['sc_mean']) / (mm['sc_scale'] + 1e-8)
-            x_pca = (x_sc - mm['pca_mean']) @ mm['pca_comp'].T
-            transported = mm['mu_t'] + (x_pca - mm['mu_s']) @ mm['A'].T
-            delta = (transported - x_pca) @ mm['pca_comp'] * (mm['sc_scale'] + 1e-8)
-            per_path[p] = (delta * BEST_LAMBDA).to(torch.bfloat16)
-        test_deltas[img_id] = per_path
-    log(f"  Deltas precomputed for {len(test_deltas)} images")
-    
-    st_reports = {}
-    t0 = time.time(); errs = 0
-    for idx, img_id in enumerate(img_ids):
-        targets = [p for p in PATHOLOGIES if probe_scores_vindr[p][idx] >= thresholds[p] and p in monge_maps]
-        if not targets:
-            st_reports[img_id] = bl_reports.get(img_id, ''); continue
-        
-        try:
-            jpg_path = jpg_dir / f'{img_id}.jpg'
-            img = Image.open(str(jpg_path)).convert('RGB')
-            inputs = proc(images=[img], text=FORMATTED_PROMPT, return_tensors='pt')
-            for k,v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(DEVICE) if v.dtype in (torch.long,torch.int) else v.to(DEVICE, dtype=DTYPE)
-            
-            fired = [False]
-            deltas = test_deltas[img_id]
-            def make_hook(tgts, dlt, flag):
-                def hook_fn(module, inp, output):
-                    if flag[0]: return output
-                    h = output[0] if isinstance(output, tuple) else output
-                    if h.shape[1] > 1:
-                        flag[0] = True
-                        hm = h.clone()
-                        total = torch.zeros(N_VIS, h.shape[2], dtype=torch.float32)
-                        for p in tgts: total += dlt[p].float()
-                        hm[0,:N_VIS,:] += total.to(device=h.device, dtype=h.dtype)
-                        return (hm,) + output[1:] if isinstance(output, tuple) else hm
-                    return output
-                return hook_fn
-            
-            hook = dec_layers[STEER_LAYER].register_forward_hook(make_hook(targets, deltas, fired))
+            if p in probes:
+                prob = probes[p].predict_proba(x31)[:, 1][0]
+                probe_scores[p] = float(prob)
+                if prob >= thresholds[p]:
+                    fired.append(p)
+
+        # Steered generation (if any pathology fires)
+        if fired and any(p in monge_maps for p in fired):
+            # Compute combined delta
+            delta = torch.zeros_like(bl_l3)
+            for p in fired:
+                if p not in monge_maps: continue
+                dd = deltas[p]
+                l3_np = bl_l3.cpu().float().numpy().reshape(N_VIS, -1)
+                l3_flat = l3_np.reshape(1, -1)
+                l3_pca = dd['pca'].transform(l3_flat)
+                shifted_pca = (dd['A'] @ (l3_pca.flatten() - dd['mu_fn']).reshape(-1, 1) + dd['mu_tp'].reshape(-1, 1)).T
+                shifted_full = dd['pca'].inverse_transform(shifted_pca).reshape(N_VIS, -1)
+                d = shifted_full - l3_np
+                delta += torch.tensor(d, device=DEVICE, dtype=DTYPE)
+
+            delta = delta * BEST_LAMBDA / max(len(fired), 1)
+
+            # Hook to inject delta
+            def make_steer_hook(delta_tensor):
+                def hook(m, inp, out):
+                    if hasattr(out, 'last_hidden_state'):
+                        h = out.last_hidden_state
+                    elif isinstance(out, tuple):
+                        h = out[0]
+                    else:
+                        return out
+                    if h.shape[1] > N_VIS:
+                        h[:, :N_VIS, :] += delta_tensor
+                    return out
+                return hook
+
+            steer_hook = model.language_model.model.layers[STEER_LAYER].register_forward_hook(
+                make_steer_hook(delta)
+            )
             with torch.no_grad():
-                ids = model.generate(**inputs, generation_config=gen_config, max_new_tokens=300, pad_token_id=tok.pad_token_id)
-            hook.remove()
-            st_reports[img_id] = tok.decode(ids[0], skip_special_tokens=True).strip()
-        except Exception as ex:
-            st_reports[img_id] = bl_reports.get(img_id, ''); errs += 1
-            if errs <= 3: log(f"  STEER ERR: {ex}")
-        
-        if (idx+1) % 100 == 0:
-            rate = (idx+1)/(time.time()-t0)
-            log(f"  Steered {idx+1}/{len(img_ids)} ({rate:.1f}/s, err:{errs})")
-    
-    json.dump(st_reports, open(st_cache, 'w'))
-    log(f"  Done: {len(st_reports)} steered reports ({errs} errors)")
+                out = model.generate(input_ids=TEXT_IDS, pixel_values=pv,
+                                     max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+                st_report = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+            steer_hook.remove()
+        else:
+            st_report = bl_report
 
-del model, proc; torch.cuda.empty_cache(); gc.collect()
+        # GT labels
+        gt = {}
+        for p in PATHOLOGIES:
+            gt[p] = 1 if row[VINDR_COLS[p]] > 0 else 0
 
-# ═══════════════════════════════════════════════════
-# STEP 6: CheXbert evaluation
-# ═══════════════════════════════════════════════════
-log("\n[Step6] CheXbert evaluation...")
-from f1chexbert import F1CheXbert
+        results.append({
+            'image_id': iid,
+            'baseline_report': bl_report,
+            'steered_report': st_report,
+            'steered': len(fired) > 0,
+            'targets': fired,
+            'probe_scores': probe_scores,
+            'gt': gt,
+        })
+
+    except Exception as e:
+        errors += 1
+        if errors <= 5: log(f"  Error on {iid}: {e}")
+
+    if (i+1) % 100 == 0:
+        steered_so_far = sum(1 for r in results if r['steered'])
+        log(f"  {i+1}/{len(valid_test)} (steered={steered_so_far}, err={errors})")
+
+for h in hooks: h.remove()
+
+json.dump(results, open(f"{OUT_DIR}/vindr_test_results.json", 'w'), indent=1)
+log(f"\nTest done: {len(results)} images, {errors} errors")
+log(f"Steered: {sum(1 for r in results if r['steered'])}/{len(results)}")
+
+# ══════════════════════════════════════════════════════════════════════
+# Step 5: Evaluate — CheXbert labels vs radiologist GT
+# ══════════════════════════════════════════════════════════════════════
+log("\nStep 5: CheXbert evaluation")
 scorer = F1CheXbert(device=DEVICE)
 
-def get_labels(reports):
-    labels = {}
-    for img_id in img_ids:
-        r = reports.get(img_id, '')
-        if not r.strip(): labels[img_id]={p:0 for p in PATHOLOGIES}; continue
-        raw = scorer.get_label(r, mode='rrg')
-        labels[img_id] = {p: int(raw[CHEXBERT_IDX[p]]) if CHEXBERT_IDX[p]<len(raw) else 0 for p in PATHOLOGIES}
-    return labels
+clean = lambda x: re.sub(r"\s+", " ", re.sub(r"\[.*?\]", "", x).replace("**", "")).strip()
 
-def eval_metrics(labels, name):
-    ttp=tfp=tfn=ttn=0; pp={}
+for condition, key in [("BASELINE", "baseline_report"), ("PARE", "steered_report")]:
+    log(f"\n  {condition}")
+    log(f"  {'Pathology':<22} {'TP':>5} {'FP':>5} {'FN':>5} {'TN':>5} {'Sens':>8} {'Spec':>8} {'F1':>8}")
+    log(f"  {'-'*80}")
+
+    all_f1s = []
     for p in PATHOLOGIES:
-        tp=fp=fn=tn=0
-        for img_id in img_ids:
-            g=vindr_gt[img_id][p]; pred=labels.get(img_id,{}).get(p,0)
-            if g==1 and pred==1: tp+=1
-            elif g==0 and pred==1: fp+=1
-            elif g==1 and pred==0: fn+=1
-            else: tn+=1
-        ttp+=tp; tfp+=fp; tfn+=fn; ttn+=tn
-        se=tp/(tp+fn) if tp+fn else 0; sp=tn/(tn+fp) if tn+fp else 0
-        pp[p]=(se,sp,tp,fp,fn)
-    sens=ttp/(ttp+tfn) if ttp+tfn else 0; spec=ttn/(ttn+tfp) if ttn+tfp else 0
-    prec=ttp/(ttp+tfp) if ttp+tfp else 0; f1=2*prec*sens/(prec+sens) if prec+sens else 0
-    log(f"\n  {name}")
-    log(f"  {'─'*65}")
-    log(f"  {'Pathology':<20s} {'Sens':>6s} {'Spec':>6s} {'TP':>5s} {'FP':>5s} {'FN':>5s}")
-    for p in PATHOLOGIES:
-        se,sp,tp,fp,fn = pp[p]
-        log(f"  {p:<20s} {se:.4f} {sp:.4f} {tp:5d} {fp:5d} {fn:5d}")
-    log(f"  {'─'*65}")
-    log(f"  OVERALL: F1={f1:.4f} Sens={sens:.4f} Spec={spec:.4f} Prec={prec:.4f}")
-    return f1
+        tp = fp = fn = tn = 0
+        for r in results:
+            # CheXbert label the report
+            text = clean(r[key])
+            if not text:
+                pred = 0
+            else:
+                raw = scorer.get_label(text, mode='rrg')
+                idx = CHEXBERT_IDX[p]
+                pred = int(raw[idx]) if idx < len(raw) and raw[idx] != '' else 0
 
-cb_bl = get_labels(bl_reports); cb_st = get_labels(st_reports)
-log("\n" + "="*70)
-log("VinDr-CXR CROSS-DATASET RESULTS (MIMIC-trained → VinDr-CXR)")
-log("="*70)
-f1_bl = eval_metrics(cb_bl, "BASELINE")
-f1_st = eval_metrics(cb_st, "PARE STEERED")
-log(f"\n  Δ(PARE vs BL): {f1_st-f1_bl:+.4f}")
-log(f"\n  MIMIC-CXR ref: BL=0.399 → PARE=0.522, Δ=+0.123")
+            gt = r['gt'][p]
+            if pred == 1 and gt == 1: tp += 1
+            elif pred == 1 and gt == 0: fp += 1
+            elif pred == 0 and gt == 1: fn += 1
+            else: tn += 1
 
-n_healthy = sum(1 for v in vindr_gt.values() if all(v[p]==0 for p in PATHOLOGIES))
-h_st = sum(1 for idx,img_id in enumerate(img_ids) if all(vindr_gt[img_id][p]==0 for p in PATHOLOGIES) and any(probe_scores_vindr[p][idx]>=thresholds[p] for p in PATHOLOGIES))
-log(f"\n  Healthy: {n_healthy}/{len(img_ids)}, steered: {h_st}/{n_healthy} ({h_st/max(n_healthy,1)*100:.1f}%)")
-log("\n✅ VINDR-CXR EVALUATION COMPLETE")
+        se = tp/(tp+fn) if (tp+fn) > 0 else 0
+        sp = tn/(tn+fp) if (tn+fp) > 0 else 0
+        f1 = 2*tp/(2*tp+fp+fn) if (2*tp+fp+fn) > 0 else 0
+        all_f1s.append(f1)
+        log(f"  {p:<22} {tp:>5} {fp:>5} {fn:>5} {tn:>5} {se:>8.4f} {sp:>8.4f} {f1:>8.4f}")
+
+    macro = np.mean(all_f1s)
+    log(f"  {'MACRO-F1':<22} {'':>5} {'':>5} {'':>5} {'':>5} {'':>8} {'':>8} {macro:>8.4f}")
+
+log("\n✅ VINDR-CXR PARE EVALUATION COMPLETE")
