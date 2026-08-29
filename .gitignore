@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pth
+*.npy
+*.pt
+*.ckpt
+*.json
+!requirements.txt
+.ipynb_checkpoints/
+wandb/
+outputs/
+results/
+*.csv
+*.out
+*.log
