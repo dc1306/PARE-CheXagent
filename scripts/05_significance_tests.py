@@ -1,17 +1,33 @@
-"""Statistical significance tests + full per-pathology metrics for PARE."""
-import json, numpy as np, re, sys
-sys.stdout = open('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/canonical_baseline/significance.out', 'w')
+"""05_significance_tests.py — Bootstrap CI + McNemar's tests.
+
+Consumes:
+  - outputs/chexagent_8b_reports.json   (from 01)
+  - outputs/pare_test_reports.json      (from 03)
+  - outputs/pare_merged_reports.json    (from 04)
+
+Produces:
+  - outputs/significance.out  (full diagnostic tables + statistical tests)
+"""
+import os, json, sys, re, numpy as np
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OUT_DIR = os.environ.get("OUTPUT_DIR", str(REPO_ROOT / "outputs"))
+DEVICE = os.environ.get("CUDA_DEVICE", "cuda:0")
+
+# Redirect output to file
+sys.stdout = open(f'{OUT_DIR}/significance.out', 'w')
 sys.stderr = sys.stdout
 
 from f1chexbert import F1CheXbert
 from scipy import stats
 
-scorer = F1CheXbert(device='cuda:0')
+scorer = F1CheXbert(device=DEVICE)
 print("Scorer loaded", flush=True)
 
-BL = json.load(open('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/canonical_baseline/chexagent_8b_reports.json'))
-PARE = json.load(open('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/pare_standardized/pare_test_reports.json'))
-MERGED = json.load(open('/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/pare_standardized/pare_merged_reports.json'))
+BL = json.load(open(f'{OUT_DIR}/chexagent_8b_reports.json'))
+PARE = json.load(open(f'{OUT_DIR}/pare_test_reports.json'))
+MERGED = json.load(open(f'{OUT_DIR}/pare_merged_reports.json'))
 
 bl_by = {r['study_id']:r for r in BL}
 pare_by = {r['study_id']:r for r in PARE}
@@ -88,7 +104,7 @@ mg_r = full_metrics(mg_labels, ref_labels, "MERGED TEXT")
 
 # ── Bootstrap CI ──
 print(f"\n{'='*120}", flush=True)
-print("BOOTSTRAP CONFIDENCE INTERVALS (B=2000)", flush=True)
+print("BOOTSTRAP CONFIDENCE INTERVALS (B=2000, Target-5 CheXbert-derived Macro-F1)", flush=True)
 np.random.seed(42)
 B = 2000
 TIDX = [LABELS.index(p) for p in TARG5]
@@ -116,19 +132,24 @@ ci = lambda a: (np.percentile(a,2.5), np.percentile(a,97.5))
 delta_pa = pa_boot - bl_boot
 delta_mg = mg_boot - bl_boot
 
-print(f"\n  {'Condition':<20} {'Mean':>7} {'95% CI':>22} {'p(Δ>0)':>8}")
+print(f"\n  {'Condition':<20} {'Mean':>7} {'95% CI':>22} {'Pr(Δ>0)':>10}")
 print(f"  {'-'*65}")
 print(f"  {'Baseline':<20} {bl_boot.mean():>7.4f} [{ci(bl_boot)[0]:.4f}, {ci(bl_boot)[1]:.4f}]")
 print(f"  {'PARE':<20} {pa_boot.mean():>7.4f} [{ci(pa_boot)[0]:.4f}, {ci(pa_boot)[1]:.4f}]")
 print(f"  {'Merged Text':<20} {mg_boot.mean():>7.4f} [{ci(mg_boot)[0]:.4f}, {ci(mg_boot)[1]:.4f}]")
-print(f"  {'Δ(PARE-BL)':<20} {delta_pa.mean():>+7.4f} [{ci(delta_pa)[0]:+.4f}, {ci(delta_pa)[1]:+.4f}] {(delta_pa>0).mean():>8.4f}")
-print(f"  {'Δ(Merged-BL)':<20} {delta_mg.mean():>+7.4f} [{ci(delta_mg)[0]:+.4f}, {ci(delta_mg)[1]:+.4f}] {(delta_mg>0).mean():>8.4f}")
+print(f"  {'Δ(PARE-BL)':<20} {delta_pa.mean():>+7.4f} [{ci(delta_pa)[0]:+.4f}, {ci(delta_pa)[1]:+.4f}] {(delta_pa>0).mean():>10.4f}")
+print(f"  {'Δ(Merged-BL)':<20} {delta_mg.mean():>+7.4f} [{ci(delta_mg)[0]:+.4f}, {ci(delta_mg)[1]:+.4f}] {(delta_mg>0).mean():>10.4f}")
+print(f"\n  Note: Pr(Δ>0) = fraction of bootstrap resamples with positive Δ (not a frequentist p-value).")
+print(f"  The 95% CI entirely above zero is the primary evidence of significance.", flush=True)
 
-# ── McNemar's test ──
+# ── McNemar's test with Holm correction ──
 print(f"\n{'='*120}", flush=True)
-print("McNEMAR'S TEST (BL vs Merged Text, per Target-5 pathology)", flush=True)
-print(f"  {'Pathology':<22} {'b(BL✓,MG✗)':>12} {'c(BL✗,MG✓)':>12} {'χ²':>8} {'p-value':>10} {'sig':>5}")
-print(f"  {'-'*75}")
+print("McNEMAR'S TEST (BL vs Merged Text, per Target-5 pathology, Holm-corrected)", flush=True)
+print(f"  {'Pathology':<22} {'b(BL✓,MG✗)':>12} {'c(BL✗,MG✓)':>12} {'χ²':>8} {'p_raw':>10} {'p_holm':>10} {'sig':>5}")
+print(f"  {'-'*85}")
+
+raw_pvals = []
+mcnemar_data = []
 for p in TARG5:
     j = LABELS.index(p)
     bl_correct = (bl_labels[:,j] == ref_labels[:,j]).astype(int)
@@ -140,8 +161,24 @@ for p in TARG5:
         pval = 1 - stats.chi2.cdf(chi2, df=1)
     else:
         chi2 = 0; pval = 1.0
-    sig = '***' if pval < 0.001 else '**' if pval < 0.01 else '*' if pval < 0.05 else 'ns'
-    print(f"  {p:<22} {b_count:>12} {c_count:>12} {chi2:>8.2f} {pval:>10.6f} {sig:>5}")
+    raw_pvals.append(pval)
+    mcnemar_data.append((p, b_count, c_count, chi2, pval))
+
+# Holm correction
+sorted_idx = np.argsort(raw_pvals)
+holm_pvals = np.ones(len(raw_pvals))
+for rank, idx in enumerate(sorted_idx):
+    holm_pvals[idx] = min(1.0, raw_pvals[idx] * (len(raw_pvals) - rank))
+# Enforce monotonicity
+for rank in range(1, len(sorted_idx)):
+    idx = sorted_idx[rank]
+    prev_idx = sorted_idx[rank-1]
+    holm_pvals[idx] = max(holm_pvals[idx], holm_pvals[prev_idx])
+
+for i, (p, b, c, chi2, praw) in enumerate(mcnemar_data):
+    ph = holm_pvals[i]
+    sig = '***' if ph < 0.001 else '**' if ph < 0.01 else '*' if ph < 0.05 else 'ns'
+    print(f"  {p:<22} {b:>12} {c:>12} {chi2:>8.2f} {praw:>10.6f} {ph:>10.6f} {sig:>5}")
 
 # ── Delta table ──
 print(f"\n{'='*120}")

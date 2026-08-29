@@ -17,7 +17,7 @@ PARE improves CheXagent-8B's diagnostic sensitivity without finetuning by:
 | Micro-F1-14 | 0.4592 | 0.4816 | **0.4945** | **+0.0353** |
 | Macro-F1-14 | 0.3307 | 0.3366 | **0.3494** | **+0.0187** |
 
-**Statistical significance:** Bootstrap 95% CI for Δ(Merged−BL) = [+0.039, +0.056], p=1.000
+**Statistical significance:** Bootstrap 95% CI for Δ(Merged−BL) = [+0.039, +0.056], entirely above zero
 
 **L31 Probe AUROC:** Mean 0.7929 across Target-5 pathologies
 
@@ -101,7 +101,7 @@ Running the full pipeline produces (not committed):
 outputs/
 ├── test_manifest.json          # From 00_prepare_mimic.py
 ├── chexagent_8b_reports.json   # From 01_baseline_generation.py
-├── pare_train_artifacts.pt     # From 02_pare_train.py (probes, maps, scalers)
+├── pare_components.pkl         # From 02_pare_train.py (probes, maps, scalers)
 ├── pare_test_reports.json      # From 03_pare_test.py
 ├── pare_merged_reports.json    # From 04_merge_eval.py
 ├── pare_merged_eval.json       # From 04_merge_eval.py

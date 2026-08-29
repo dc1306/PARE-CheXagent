@@ -1,17 +1,30 @@
-"""Run safe text merge + evaluation on existing PARE reports."""
-import json, sys, re, numpy as np
-from collections import Counter
-sys.path.insert(0, '/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/canonical_baseline')
+"""04_merge_eval.py — Safe text merge + F1CheXbert evaluation.
 
-from safe_merger import safe_merge
+Consumes:
+  - outputs/chexagent_8b_reports.json   (from 01)
+  - outputs/pare_test_reports.json      (from 03)
+
+Produces:
+  - outputs/pare_merged_reports.json
+  - outputs/pare_merged_eval.json
+  - outputs/pare_all_reports.csv
+"""
+import os, json, sys, re, numpy as np, pandas as pd
+from pathlib import Path
+from collections import Counter
+
+# Repo-relative import
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from utils.safe_merger import safe_merge
 from f1chexbert import F1CheXbert
 
-scorer = F1CheXbert(device='cuda:0')
-print("Scorer loaded", flush=True)
+OUT_DIR = os.environ.get("OUTPUT_DIR", str(REPO_ROOT / "outputs"))
+BL_PATH = os.path.join(OUT_DIR, "chexagent_8b_reports.json")
+PARE_PATH = os.path.join(OUT_DIR, "pare_test_reports.json")
 
-BL_PATH = '/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/canonical_baseline/chexagent_8b_reports.json'
-PARE_PATH = '/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/pare_standardized/pare_test_reports.json'
-OUT_DIR = '/mnt/raid/obed/Medical_MoE_Project/Medical-VLM-Enrichment/experiments/pare_standardized'
+scorer = F1CheXbert(device=os.environ.get("CUDA_DEVICE", "cuda:0"))
+print("Scorer loaded", flush=True)
 
 bl = json.load(open(BL_PATH))
 pare = json.load(open(PARE_PATH))
